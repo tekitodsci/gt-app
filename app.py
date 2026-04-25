@@ -10,10 +10,9 @@
 終了するには Ctrl+C を押してください。
 """
 
-import json
 import os
-import re
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 import requests
 from flask import Flask, jsonify, request as flask_request
@@ -36,97 +35,86 @@ HEADERS = {
 }
 
 
+def fetch_suggest(keyword, lang="ja"):
+    """Fetch Google search suggestions for a keyword."""
+    try:
+        url = f"https://suggestqueries.google.com/complete/search?client=firefox&q={requests.utils.quote(keyword)}&hl={lang}"
+        resp = requests.get(url, headers=HEADERS, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if len(data) >= 2 and isinstance(data[1], list):
+                # Filter out the original keyword
+                return [s for s in data[1] if s.lower() != keyword.lower()][:5]
+    except:
+        pass
+    return []
+
+
 def fetch_daily_trends(geo="JP"):
-    """Fetch daily trending searches from Google Trends."""
-    url = f"https://trends.google.com/trends/api/dailytrends?hl=ja&tz=-540&geo={geo}&ns=15"
+    """Fetch daily trending searches from Google Trends RSS."""
+    url = f"https://trends.google.com/trending/rss?geo={geo}"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
 
-    # Google prepends ")]}'" to the JSON response
-    text = resp.text
-    if text.startswith(")]}'"):
-        text = text[5:]
+    root = ET.fromstring(resp.text)
 
-    data = json.loads(text)
-    trends = []
-
-    days = data.get("default", {}).get("trendingSearchesDays", [])
-    rank = 0
-    for day in days:
-        for search in day.get("trendingSearches", []):
-            rank += 1
-            title_data = search.get("title", {})
-            keyword = title_data.get("query", "")
-            traffic = search.get("formattedTraffic", "")
-
-            # Related queries
-            related = []
-            for rq in search.get("relatedQueries", []):
-                related.append(rq.get("query", ""))
-
-            # Articles
-            articles = []
-            for art in search.get("articles", [])[:2]:
-                articles.append({
-                    "title": art.get("title", ""),
-                    "source": art.get("source", ""),
-                    "url": art.get("url", ""),
-                })
-
-            # Heat score (approximate from traffic string)
-            heat = 90 - (rank - 1) * 4
-            if heat < 5:
-                heat = 5
-
-            trends.append({
-                "keyword": keyword,
-                "traffic": traffic,
-                "related": related[:5],
-                "articles": articles,
-                "heat": heat,
-                "rank": rank,
-            })
-
-            if rank >= 20:
-                break
-        if rank >= 20:
+    # Find the namespace dynamically from the RSS
+    ns_map = {}
+    for elem in root.iter():
+        for key, val in elem.attrib.items():
+            if key.startswith("{"):
+                ns_uri = key.split("}")[0][1:]
+                ns_map["ht"] = ns_uri
+        if "ht" in ns_map:
             break
 
-    return trends
+    # Fallback namespace
+    if "ht" not in ns_map:
+        ns_map["ht"] = "https://trends.google.com/trending/rss"
 
-
-def fetch_realtime_trends(geo="JP"):
-    """Fetch realtime trending topics from Google Trends."""
-    url = (
-        f"https://trends.google.com/trends/api/realtimetrends"
-        f"?hl=ja&tz=-540&cat=all&fi=0&fs=0&geo={geo}&ri=300&rs=20&sort=0"
-    )
-    resp = requests.get(url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-
-    text = resp.text
-    if text.startswith(")]}'"):
-        text = text[5:]
-
-    data = json.loads(text)
+    # Also try finding items with namespace prefix
     trends = []
     rank = 0
 
-    stories = data.get("storySummaries", {}).get("trendingStories", [])
-    for story in stories:
-        rank += 1
-        # Get entity names as keywords
-        entities = story.get("entityNames", [])
-        keyword = "、".join(entities[:3]) if entities else "不明"
+    lang = "ja" if geo == "JP" else "en"
 
-        # Articles
+    for item in root.findall(".//item"):
+        rank += 1
+        keyword = item.findtext("title", "")
+
+        # Try both namespace patterns
+        traffic = ""
         articles = []
-        for art in story.get("articles", [])[:2]:
-            articles.append({
-                "title": art.get("articleTitle", ""),
-                "source": art.get("source", ""),
-                "url": art.get("url", ""),
-            })
+
+        # Search all child elements for traffic and news
+        for child in item:
+            tag = child.tag
+            # Strip namespace
+            local_tag = tag.split("}")[-1] if "}" in tag else tag
+
+            if local_tag == "approx_traffic":
+                traffic = child.text or ""
+            elif local_tag == "news_item":
+                news_title = ""
+                news_url = ""
+                news_source = ""
+                for nc in child:
+                    nc_tag = nc.tag.split("}")[-1] if "}" in nc.tag else nc.tag
+                    if nc_tag == "news_item_title":
+                        news_title = nc.text or ""
+                    elif nc_tag == "news_item_url":
+                        news_url = nc.text or ""
+                    elif nc_tag == "news_item_source":
+                        news_source = nc.text or ""
+                if news_title:
+                    articles.append({
+                        "title": news_title,
+                        "source": news_source,
+                        "url": news_url,
+                    })
+
+        # Fetch related keywords via Google Suggest
+        related = fetch_suggest(keyword, lang)
 
         heat = 95 - (rank - 1) * 4
         if heat < 5:
@@ -134,9 +122,9 @@ def fetch_realtime_trends(geo="JP"):
 
         trends.append({
             "keyword": keyword,
-            "traffic": "",
-            "related": entities[:5],
-            "articles": articles,
+            "traffic": traffic,
+            "related": related,
+            "articles": articles[:3],
             "heat": heat,
             "rank": rank,
         })
@@ -145,6 +133,11 @@ def fetch_realtime_trends(geo="JP"):
             break
 
     return trends
+
+
+def fetch_realtime_trends(geo="JP"):
+    """Fetch realtime trending - uses same RSS feed as daily."""
+    return fetch_daily_trends(geo)
 
 
 @app.route("/")
@@ -254,28 +247,6 @@ HTML_PAGE = """<!DOCTYPE html>
 
   .tab:hover { border-color: var(--accent); color: var(--text); }
   .tab.active { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 500; }
-
-  .mode-controls {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 20px;
-    align-items: center;
-  }
-
-  .mode-btn {
-    padding: 5px 12px;
-    border-radius: 14px;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-dim);
-    font-family: 'Noto Sans JP', sans-serif;
-    font-size: 11px;
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-
-  .mode-btn:hover { border-color: var(--accent); color: var(--text); }
-  .mode-btn.active { background: var(--surface); border-color: var(--accent); color: var(--accent); font-weight: 500; }
 
   .fetch-btn {
     padding: 7px 18px;
@@ -538,11 +509,6 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="fetch-btn" id="fetchBtn">トレンドを取得</button>
   </div>
 
-  <div class="mode-controls">
-    <button class="mode-btn active" data-mode="daily">デイリー</button>
-    <button class="mode-btn" data-mode="realtime">リアルタイム</button>
-  </div>
-
   <div class="info-bar">
     <div class="status">
       <div class="status-dot" id="statusDot" style="background:var(--accent)"></div>
@@ -559,31 +525,23 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 
   <div class="footer">
-    データソース: <a href="https://trends.google.com" target="_blank">Google Trends</a><br><br>
-    <strong>このアプリについて</strong><br>
-    Google トレンドの「急上昇ワード」を取得し、検索ボリューム順に表示します。<br>
-    デイリーモードはその日の急上昇ワード、リアルタイムモードは直近の話題を表示します。<br>
-    各トピックをクリックすると、関連キーワードと関連ニュース記事が展開されます。
+    データソース: <a href="https://trends.google.com" target="_blank">Google Trends</a> RSS<br><br>
+    <strong>読み方ガイド</strong><br>
+    ・上にあるほど新しく急上昇したトピックです（時系列順）<br>
+    ・「200+ 検索」などの数字は、普段と比べて急増した検索数の概算です<br>
+    ・数字が同じでも順位が違うのは、急上昇のタイミングの新しさで並んでいるためです<br>
+    ・各トピックをクリックすると、関連キーワードと関連ニュースが展開されます
   </div>
 </div>
 
 <script>
 let currentGeo = 'JP';
-let currentMode = 'daily';
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     currentGeo = tab.dataset.geo;
-  });
-});
-
-document.querySelectorAll('.mode-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    currentMode = btn.dataset.mode;
   });
 });
 
@@ -602,7 +560,13 @@ function setStatus(color, text) {
 }
 
 function getRankClass(i) {
-  return i === 0 ? 'rank-1' : i === 1 ? 'rank-2' : i === 2 ? 'rank-3' : '';
+  return i < 3 ? 'rank-' + (i+1) : '';
+}
+
+function getNewness(i) {
+  if (i < 3) return '🆕';
+  if (i < 8) return '⚡';
+  return '';
 }
 
 function renderTrends(trends) {
@@ -611,9 +575,9 @@ function renderTrends(trends) {
     <div class="trend-item ${getRankClass(i)}" style="animation-delay:${i*0.04}s">
       <div class="rank-num">${String(i+1).padStart(2,'0')}</div>
       <div>
-        <div class="trend-keyword">${t.keyword} <span class="expand-hint">▼</span></div>
+        <div class="trend-keyword">${getNewness(i)} ${t.keyword} <span class="expand-hint">▼</span></div>
         <div class="trend-meta">
-          ${t.traffic ? `<span class="traffic-badge">${t.traffic} 検索</span>` : ''}
+          ${t.traffic ? `<span class="traffic-badge">🔎 急上昇 ${t.traffic}</span>` : ''}
         </div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
@@ -657,7 +621,7 @@ async function fetchTrends() {
   list.innerHTML = '<div class="msg-area"><div class="spinner"></div>Google トレンドから取得中...</div>';
 
   try {
-    const resp = await fetch(`/api/trends?geo=${currentGeo}&mode=${currentMode}`);
+    const resp = await fetch(`/api/trends?geo=${currentGeo}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
 
